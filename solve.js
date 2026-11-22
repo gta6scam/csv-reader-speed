@@ -1,28 +1,38 @@
-// solve.js — a fast drop-in for csv-reader 1.0.0, make.fun's reference CSV reader.
+// solve.js — QuadScan: a cold-optimized drop-in for csv-reader 1.0.0.
 //
-// run(input) returns exactly csv-reader 1.0.0's answer for every input {text, header}: the JSON value
-// {columns, rows, errors} under csv-reader's broken-row policy (a U+FEFF at the start is dropped; records end at
-// LF or CRLF; blank lines are no records; a lone CR outside quotes is dropped as stray_cr; a quoted field runs to
-// the next undoubled quote, "" inside it is one quote, CRLF and lone CR inside it read as LF; junk after a closing
-// quote is appended as it stands, quote_junk; a quote that never closes is a literal character and the rest is
-// re-read unquoted, unterminated_quote; fields are padded/cut to the first record's width, short_row/long_row).
+// Semantics are exactly csv-reader's (identical to challenger-r2's decisions):
+// BOM dropped; records end at LF/CRLF; blank lines are no records; lone CR
+// outside quotes dropped as stray_cr; a quoted field runs to the next
+// undoubled quote, "" is one quote, CRLF/lone CR inside read as LF; junk
+// after a closing quote is appended as it stands (quote_junk when the field
+// ends, after any stray_cr met inside the junk); a quote that never closes
+// is a literal and the rest is re-read unquoted (unterminated_quote, then
+// stray_cr in that re-read as met); fields padded/cut to the first record's
+// width (short_row with fields:, long_row with extra:); errors are
+// {code, line, row} in the order met, line = the record's starting line,
+// row = its index in rows (null for the header).
 //
-// How it is fast, without changing a single answer:
-//   - one pass over the text with charCodeAt, fields taken out with slice() — never a character at a time;
-//   - the common field (no stray CR) is scanned inline and sliced once; the rare broken paths (a stray CR in an
-//     unquoted field, junk after a closing quote, an unterminated quote's re-read) go through readUnqFull, which
-//     rebuilds the value from slices between the dropped CRs;
-//   - a quoted field with no doubled quote and no CR inside is a single slice; escapes and CRs are stitched from
-//     slices only when they actually occur;
-//   - no per-field objects, no regular expressions, nothing kept from one call to the next.
+// Architecture "QuadScan" (new; no split fast path, no regex, no warmup):
+//  - The main unquoted scan is an unrolled loop that consumes FOUR code
+//    units per iteration when none of the four is a delimiter (comma 44,
+//    quote 34, LF 10, CR 13): all four codes are checked, and if any is a
+//    delimiter the loop falls into a scalar step-by-step handler for the
+//    unit at the scan position; otherwise it advances 4 at once.
+//  - Field values are slices of the input; a quoted field's value is one
+//    slice when it holds no escape or line break, a join of slices else.
+//  - Quoted fields are handled by a dedicated sub-loop (also 4-wide for
+//    plain stretches, scalar at quote/CR/LF).
+//  - Minimal module-level code: two small helpers only, no tables, no
+//    self-warmup, so cold module init is near-zero. The rare paths that
+//    must rescan a field (stray CR inside it, junk after a closing quote,
+//    an unterminated quote's re-read) share readUnqFull, which
+//    accumulates the field's pieces and joins them once (scalar, rare).
 
-// How a field ended: 0 at a comma (the record goes on), 1 at a line break, 2 at the end of the text.
+function joinParts(parts, t, seg, pos) {
+  parts.push(t.slice(seg, pos));
+  return parts.join('');
+}
 
-/**
- * The full unquoted read, for the rare paths: reads from pos with an existing prefix value, dropping lone CRs
- * (stray_cr, in the order met) and building the value from the slices between them.
- * Returns [value, ended, added, pos, line]: added counts the characters this read kept.
- */
 function readUnqFull(t, pos, line, recordLine, recordRow, errors, prefix) {
   const n = t.length;
   let parts = null;
@@ -30,16 +40,16 @@ function readUnqFull(t, pos, line, recordLine, recordRow, errors, prefix) {
   let added = 0;
   while (pos < n) {
     const c = t.charCodeAt(pos);
-    if (c === 44) { // ','
+    if (c === 44) {
       added += pos - seg;
       return [parts === null ? prefix + t.slice(seg, pos) : prefix + joinParts(parts, t, seg, pos), 0, added, pos + 1, line];
     }
-    if (c === 10) { // LF
+    if (c === 10) {
       added += pos - seg;
       return [parts === null ? prefix + t.slice(seg, pos) : prefix + joinParts(parts, t, seg, pos), 1, added, pos + 1, line + 1];
     }
-    if (c === 13) { // CR
-      if (t.charCodeAt(pos + 1) === 10) { // CRLF ends the field
+    if (c === 13) {
+      if (t.charCodeAt(pos + 1) === 10) {
         added += pos - seg;
         return [parts === null ? prefix + t.slice(seg, pos) : prefix + joinParts(parts, t, seg, pos), 1, added, pos + 2, line + 1];
       }
@@ -57,12 +67,6 @@ function readUnqFull(t, pos, line, recordLine, recordRow, errors, prefix) {
   return [parts === null ? prefix + t.slice(seg, pos) : prefix + joinParts(parts, t, seg, pos), 2, added, pos, line];
 }
 
-function joinParts(parts, t, seg, pos) {
-  parts.push(t.slice(seg, pos));
-  return parts.join('');
-}
-
-/** csv-reader 1.0.0's answer for one case's input, computed faster. */
 export function run(input) {
   const t = String(input.text);
   const header = input.header === true;
@@ -72,12 +76,12 @@ export function run(input) {
   let columns = null;
   let width = -1;
 
-  let pos = 0; // the next character to read
-  let line = 1; // the line that character is on
-  if (t.charCodeAt(0) === 0xFEFF) pos = 1; // a U+FEFF at the very start is dropped
+  let pos = 0;
+  let line = 1;
+  if (t.charCodeAt(0) === 0xFEFF) pos = 1;
 
   while (true) {
-    // Lines with no characters are no records.
+    // Blank lines (empty, or LF/CRLF only) are no records.
     while (pos < n) {
       const c = t.charCodeAt(pos);
       if (c === 10) { pos += 1; line += 1; }
@@ -93,9 +97,9 @@ export function run(input) {
     let ended = 0;
 
     do {
-      fQuoted = pos < n && t.charCodeAt(pos) === 34; // '"'
+      fQuoted = pos < n && t.charCodeAt(pos) === 34;
       if (fQuoted) {
-        // ---- a field that opens with a quote ----
+        // ---- dedicated quoted sub-loop ----
         const open = pos;
         let j = pos + 1;
         const seg0 = j;
@@ -104,9 +108,24 @@ export function run(input) {
         let scanLine = line;
         let closed = false;
         while (j < n) {
+          // 4-wide plain stretch: none of the four is quote/CR/LF.
+          if (j + 4 <= n) {
+            const a = t.charCodeAt(j);
+            const b = t.charCodeAt(j + 1);
+            const c2 = t.charCodeAt(j + 2);
+            const d = t.charCodeAt(j + 3);
+            if (a !== 34 && a !== 13 && a !== 10 &&
+                b !== 34 && b !== 13 && b !== 10 &&
+                c2 !== 34 && c2 !== 13 && c2 !== 10 &&
+                d !== 34 && d !== 13 && d !== 10) {
+              j += 4;
+              continue;
+            }
+          }
+          // Scalar step for the unit at j.
           const c = t.charCodeAt(j);
-          if (c === 34) { // '"'
-            if (t.charCodeAt(j + 1) === 34) { // a doubled quote is one quote
+          if (c === 34) {
+            if (t.charCodeAt(j + 1) === 34) {
               if (parts === null) parts = [];
               parts.push(t.slice(seg, j), '"');
               j += 2;
@@ -116,7 +135,7 @@ export function run(input) {
             closed = true;
             break;
           }
-          if (c === 13) { // CRLF and a lone CR inside quotes are each one LF
+          if (c === 13) {
             if (parts === null) parts = [];
             parts.push(t.slice(seg, j), '\n');
             scanLine += 1;
@@ -128,8 +147,6 @@ export function run(input) {
           j += 1;
         }
         if (!closed) {
-          // The quote never closes: it is a literal character, and the text after it is read again as unquoted.
-          // (line is untouched: the aborted scan counted on scanLine, which is discarded, as the reference resets.)
           errors.push({ code: 'unterminated_quote', line: recordLine, row: recordRow });
           const r = readUnqFull(t, open + 1, line, recordLine, recordRow, errors, '"');
           fields.push(r[0]);
@@ -148,7 +165,6 @@ export function run(input) {
         if (c === 44) { pos += 1; fields.push(value); ended = 0; continue; }
         if (c === 10) { pos += 1; line += 1; fields.push(value); ended = 1; continue; }
         if (c === 13 && t.charCodeAt(pos + 1) === 10) { pos += 2; line += 1; fields.push(value); ended = 1; continue; }
-        // What follows the closing quote is appended as it stands, up to the next comma or line break.
         const r = readUnqFull(t, pos, line, recordLine, recordRow, errors, value);
         if (r[2] > 0) errors.push({ code: 'quote_junk', line: recordLine, row: recordRow });
         fields.push(r[0]);
@@ -158,7 +174,7 @@ export function run(input) {
         continue;
       }
 
-      // ---- an unquoted field: scan to its end, slice it out ----
+      // ---- QuadScan main loop: unquoted field ----
       const start = pos;
       let j = pos;
       let endPos = n;
@@ -166,14 +182,32 @@ export function run(input) {
       let after = n;
       let stray = false;
       while (j < n) {
+        // Consume FOUR code units at once when none is a delimiter
+        // (comma 44, quote 34, LF 10, CR 13).
+        if (j + 4 <= n) {
+          const a = t.charCodeAt(j);
+          const b = t.charCodeAt(j + 1);
+          const c2 = t.charCodeAt(j + 2);
+          const d = t.charCodeAt(j + 3);
+          if (a !== 44 && a !== 34 && a !== 10 && a !== 13 &&
+              b !== 44 && b !== 34 && b !== 10 && b !== 13 &&
+              c2 !== 44 && c2 !== 34 && c2 !== 10 && c2 !== 13 &&
+              d !== 44 && d !== 34 && d !== 10 && d !== 13) {
+            j += 4;
+            continue;
+          }
+        }
+        // Scalar step-by-step handler for the unit at j.
         const c = t.charCodeAt(j);
         if (c === 44) { endPos = j; endType = 0; after = j + 1; break; }
         if (c === 10) { endPos = j; endType = 1; after = j + 1; break; }
         if (c === 13) {
           if (t.charCodeAt(j + 1) === 10) { endPos = j; endType = 1; after = j + 2; }
-          else stray = true; // a lone CR inside: the full read rebuilds the value without it
+          else stray = true;
           break;
         }
+        // Quote inside an unquoted field is a literal character; any
+        // other unit is literal too: advance one.
         j += 1;
       }
       if (stray) {
@@ -190,7 +224,7 @@ export function run(input) {
       ended = endType;
     } while (ended === 0);
 
-    // A line that held only stray CRs is left with no characters: no record (its stray_cr errors stay).
+    // A line that held only stray CRs is left with no characters: no record.
     if (fields.length === 1 && fields[0] === '' && !fQuoted) continue;
 
     if (width < 0) width = fields.length;
@@ -207,23 +241,4 @@ export function run(input) {
     rows.push(fields);
   }
   return { columns: header ? (columns ?? []) : null, rows, errors };
-}
-
-// ---- self-warmup (research): exercise every code path on a small synthetic input at import
-// time, so the JIT tiers the hot loops up before the real cases arrive. Pure: run() keeps no
-// state between calls, and the warmup results are discarded.
-{
-  const rows = [];
-  rows.push('int,phrase,note,code,word,decimal,date,maybe');
-  for (let i = 0; i < 40; i++) {
-    rows.push(`${i * 37},"phrase, with ""quoted"" commas","note line one\r\nline two with\rlone cr",AB-${1000 + i},word${i % 7},${i}.25,20${10 + (i % 20)}-01-15,`);
-    rows.push(`${i},"junk after quote"x,short`);
-    rows.push(`a,b\rc,d,e,f,g,h,extra1,extra2`);
-    rows.push('');
-  }
-  rows.push('tail,"unterminated never closes,more text here');
-  const sample = rows.join('\r\n');
-  const inp = { text: sample, header: true };
-  const reps = 40;
-  for (let r = 0; r < reps; r++) run(inp);
 }
