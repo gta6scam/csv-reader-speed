@@ -208,3 +208,22 @@ export function run(input) {
   }
   return { columns: header ? (columns ?? []) : null, rows, errors };
 }
+
+// ---- self-warmup (research): exercise every code path on a small synthetic input at import
+// time, so the JIT tiers the hot loops up before the real cases arrive. Pure: run() keeps no
+// state between calls, and the warmup results are discarded.
+{
+  const rows = [];
+  rows.push('int,phrase,note,code,word,decimal,date,maybe');
+  for (let i = 0; i < 40; i++) {
+    rows.push(`${i * 37},"phrase, with ""quoted"" commas","note line one\r\nline two with\rlone cr",AB-${1000 + i},word${i % 7},${i}.25,20${10 + (i % 20)}-01-15,`);
+    rows.push(`${i},"junk after quote"x,short`);
+    rows.push(`a,b\rc,d,e,f,g,h,extra1,extra2`);
+    rows.push('');
+  }
+  rows.push('tail,"unterminated never closes,more text here');
+  const sample = rows.join('\r\n');
+  const inp = { text: sample, header: true };
+  const reps = 40;
+  for (let r = 0; r < reps; r++) run(inp);
+}
